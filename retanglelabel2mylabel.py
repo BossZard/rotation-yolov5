@@ -78,7 +78,7 @@ def trans(file, line_, wh_list):
         # line = line + str(cls) + ' ' + str(c_x / 1024) + ' ' + str(c_y / 1024) + ' ' + str(h / 1024) + ' ' + str(
         #     w / 1024) + ' ' + str(int(theta) + 90) + '\n'
         wh_list.append([h/1024, w/1024])
-    with open(r'D:\hjj\yolov5\yolov5-ship\convertor\fold0\labels_ship\{}'.format(str(int(os.path.splitext(file)[0])+2008) + '.txt'),
+    with open(opt.output_path+'/{}'.format(str(int(os.path.splitext(file)[0])+2008) + '.txt'),
               'w+') as f:
 
         f.write(line)
@@ -132,10 +132,12 @@ def trans(file, line_, wh_list):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--label_path', type=str, default=r'D:\hjj\火箭军\科目四按图索骥\科目四初赛第一阶段\train\labels/',
+    parser.add_argument('--label_path', type=str,
                         help='label path')
-    parser.add_argument('--img_path', type=str, default=r'D:\hjj\火箭军\科目四按图索骥\科目四初赛第一阶段\train\images/',
-                        help='initial weights path')
+    parser.add_argument('--img_path', type=str,
+                        help='images path')
+    parser.add_argument('--output_path', type=str, default=r'convertor\fold0\labels_output/',
+                        help='label output path')
     opt = parser.parse_args()
     label_path = opt.label_path
     img_path = opt.img_path

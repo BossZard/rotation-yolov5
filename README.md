@@ -10,6 +10,7 @@ you can download the [weights](https://pan.baidu.com/s/1l7AwoT78tQEQ-K_vOJobQQ)(
 ```bash
 $ python detect.py
 ```
+![image](result.png)
 # train
 ## what format my model need
 Not much different from yolo dataset,just add an __angle__ and we define the box attribute w is always __longer__ than h!
@@ -27,4 +28,4 @@ Range for angle is [-90，90), so wo should __add 90 __in angle while make your 
 $ python train.py
 ```
 # details
-If you have any question,welcome discuss with me by [This](https://zhuanlan.zhihu.com/p/270388743)
+If you have any question,welcome discuss with me by [This](https://zhuanlan.zhihu.com/p/270388743) or email to prozacliang@qq.com

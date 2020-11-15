@@ -1310,7 +1310,7 @@ def rectlong2opencv_cuda(boxes):
 
 def plot_one_box(x, img, color=None, label=None, line_thickness=None, path=None):
     # Plots one bounding box on image img
-    maxbox = Polygon([(0, 0), (img.shape[0], 0), (img.shape[0], img.shape[0]),(0, img.shape[0])])
+    maxbox = Polygon([(0, 0), (img.shape[1], 0), (img.shape[1], img.shape[0]),(0, img.shape[0])])
     x = np.array(x)
     x[-1] *= 180 / np.pi
     opencv_rect = rectlong2opencv(x)

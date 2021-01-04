@@ -21,11 +21,18 @@ Attention!we define angle is a classify question,so we define 180 classes for an
 
 For Example:
 ![image](rbox.png)
-Range for angle is [-90，90), so wo should __add 90 __in angle while make your dataset label and then your label's Range should be [0,179)
+Range for angle is [-90，90), so wo should __add__ __90__ in angle while make your dataset label and then your label's Range should be [0,179)
 ![image](label_format.png)
+## modify yaml
+models/yolov5m.yaml: set nc to your dataset class num;
+data/wheat0.yaml:set nc to your dataset class num, and set names to your dataset class name;
 
 ```bash
 $ python train.py
 ```
+# update
+2021.1.4---correct some BUG for training
+
+
 # details
 If you have any question,welcome discuss with me by [This](https://zhuanlan.zhihu.com/p/270388743) or email to prozacliang@qq.com

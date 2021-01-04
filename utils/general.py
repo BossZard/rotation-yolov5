@@ -24,7 +24,7 @@ from tqdm import tqdm
 
 from utils.google_utils import gsutil_getsize
 from utils.torch_utils import is_parallel, init_torch_seeds
-
+from shapely.geometry import Polygon, MultiPoint
 # Set printoptions
 torch.set_printoptions(linewidth=320, precision=5, profile='long')
 np.set_printoptions(linewidth=320, formatter={'float_kind': '{:11.5g}'.format})  # format short g, %precision=5
@@ -474,15 +474,29 @@ class BCEBlurWithLogitsLoss(nn.Module):
         return loss.mean()
 
 
+def gaussian_label(label, num_class, u=0, sig=4.0):
+
+    x = np.array(range(math.floor(-num_class / 2), math.ceil(num_class / 2), 1))
+    y_sig = np.exp(-(x - u) ** 2 / (2 * sig ** 2))
+    return np.concatenate([y_sig[math.ceil(num_class / 2) - int(label.item()):],
+                           y_sig[:math.ceil(num_class / 2) - int(label.item())]], axis=0)
+
+
 def compute_loss(p, targets, model):  # predictions, targets, model
+    # target shape :
+
     device = targets.device
-    lcls, lbox, lobj = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
-    tcls, tbox, indices, anchors = build_targets(p, targets, model)  # targets
+    class_num = p[0].shape[-1] - 180 - 5
+    lcls, lbox, lobj, langle = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
+
+    tcls, tbox, indices, anchors, tangle = build_targets(p, targets, model)  # targets
+
     h = model.hyp  # hyperparameters
 
     # Define criteria
     BCEcls = nn.BCEWithLogitsLoss(pos_weight=torch.Tensor([h['cls_pw']])).to(device)
     BCEobj = nn.BCEWithLogitsLoss(pos_weight=torch.Tensor([h['obj_pw']])).to(device)
+    BCEangle = nn.BCEWithLogitsLoss(pos_weight=torch.Tensor([h['angle_pw']])).to(device)
 
     # Class label smoothing https://arxiv.org/pdf/1902.04103.pdf eqn 3
     cp, cn = smooth_BCE(eps=0.0)
@@ -490,7 +504,7 @@ def compute_loss(p, targets, model):  # predictions, targets, model
     # Focal loss
     g = h['fl_gamma']  # focal loss gamma
     if g > 0:
-        BCEcls, BCEobj = FocalLoss(BCEcls, g), FocalLoss(BCEobj, g)
+        BCEcls, BCEobjm, BCEangle = FocalLoss(BCEcls, g), FocalLoss(BCEobj, g), FocalLoss(BCEangle, g)
 
     # Losses
     nt = 0  # number of targets
@@ -515,11 +529,19 @@ def compute_loss(p, targets, model):  # predictions, targets, model
             # Objectness
             tobj[b, a, gj, gi] = (1.0 - model.gr) + model.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
 
+            # langle
+            ttheta = torch.zeros_like(ps[:, 5+class_num:])
+            for idx in range(len(ps)):
+                theta = tangle[i][idx]
+                csl_label = gaussian_label(theta, 180, u=0, sig=6)
+                ttheta[idx] = torch.from_numpy(csl_label)
+            langle += BCEangle(ps[:, 5+class_num:], ttheta)
+
             # Classification
             if model.nc > 1:  # cls loss (only if multiple classes)
-                t = torch.full_like(ps[:, 5:], cn, device=device)  # targets
+                t = torch.full_like(ps[:, 5:5+class_num:], cn, device=device)  # targets
                 t[range(n), tcls[i]] = cp
-                lcls += BCEcls(ps[:, 5:], t)  # BCE
+                lcls += BCEcls(ps[:, 5:5+class_num:], t)  # BCE
 
             # Append targets to text file
             # with open('targets.txt', 'a') as file:
@@ -531,77 +553,261 @@ def compute_loss(p, targets, model):  # predictions, targets, model
     lbox *= h['box'] * s
     lobj *= h['obj'] * s * (1.4 if np == 4 else 1.)
     lcls *= h['cls'] * s
+    langle *= h['angle'] * s
     bs = tobj.shape[0]  # batch size
 
-    loss = lbox + lobj + lcls
-    return loss * bs, torch.cat((lbox, lobj, lcls, loss)).detach()
+    loss = lbox + lobj + lcls + langle
+    return loss * bs, torch.cat((lbox, lobj, lcls, langle, loss)).detach()
 
 
+# def build_targets(p, targets, model):
+#     targets = targets[..., :-1]
+#     # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
+#     det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
+#     na, nt = det.na, targets.shape[0]  # number of anchors, targets
+#     tcls, tbox, indices, anch = [], [], [], []
+#     gain = torch.ones(7, device=targets.device)  # normalized to gridspace gain
+#     # gain = torch.ones(8, device=targets.device)
+#     ai = torch.arange(na, device=targets.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
+#     targets = torch.cat((targets.repeat(na, 1, 1), ai[:, :, None]), 2)  # append anchor indices
+#
+#     g = 0.5  # bias
+#     off = torch.tensor([[0, 0],
+#                         [1, 0], [0, 1], [-1, 0], [0, -1],  # j,k,l,m
+#                         # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lm
+#                         ], device=targets.device).float() * g  # offsets
+#
+#     for i in range(det.nl):
+#         anchors = det.anchors[i]
+#         print(p[i].shape)
+#         print(gain.shape)
+#         gain[2:6] = torch.tensor(p[i].shape)[[3, 2, 3, 2]]  # xyxy gain
+#
+#         # Match targets to anchors
+#         t = targets * gain
+#         if nt:
+#             # Matches
+#             r = t[:, :, 4:6] / anchors[:, None]  # wh ratio
+#             j = torch.max(r, 1. / r).max(2)[0] < model.hyp['anchor_t']  # compare
+#             # j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n)=wh_iou(anchors(3,2), gwh(n,2))
+#             t = t[j]  # filter
+#
+#             # Offsets
+#             gxy = t[:, 2:4]  # grid xy
+#             gxi = gain[[2, 3]] - gxy  # inverse
+#             j, k = ((gxy % 1. < g) & (gxy > 1.)).T
+#             l, m = ((gxi % 1. < g) & (gxi > 1.)).T
+#             j = torch.stack((torch.ones_like(j), j, k, l, m))
+#             t = t.repeat((5, 1, 1))[j]
+#             offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j]
+#         else:
+#             t = targets[0]
+#             offsets = 0
+#
+#         # Define
+#         b, c = t[:, :2].long().T  # image, class
+#         gxy = t[:, 2:4]  # grid xy
+#         gwh = t[:, 4:6]  # grid wh
+#         gij = (gxy - offsets).long()
+#         gi, gj = gij.T  # grid xy indices
+#
+#         # Append
+#         a = t[:, 6].long()  # anchor indices
+#         indices.append((b, a, gj, gi))  # image, anchor, grid indices
+#         tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
+#         anch.append(anchors[a])  # anchors
+#         tcls.append(c)  # class
+#
+#     return tcls, tbox, indices, anch
 def build_targets(p, targets, model):
-    # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
-    det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
+    # Build targets for compute_loss(), input targets(image,class,x,y,w,h, angle)
+    det = model.module.model[-1] if type(model) in (nn.parallel.DataParallel, nn.parallel.DistributedDataParallel) \
+        else model.model[-1]  # Detect() module
     na, nt = det.na, targets.shape[0]  # number of anchors, targets
-    tcls, tbox, indices, anch = [], [], [], []
+    tcls, tbox, indices, anch, tangle = [], [], [], [], []
     gain = torch.ones(7, device=targets.device)  # normalized to gridspace gain
-    ai = torch.arange(na, device=targets.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
-    targets = torch.cat((targets.repeat(na, 1, 1), ai[:, :, None]), 2)  # append anchor indices
-
-    g = 0.5  # bias
-    off = torch.tensor([[0, 0],
-                        [1, 0], [0, 1], [-1, 0], [0, -1],  # j,k,l,m
-                        # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lm
-                        ], device=targets.device).float() * g  # offsets
-
+    off = torch.tensor([[1, 0], [0, 1], [-1, 0], [0, -1]], device=targets.device).float()  # overlap offsets
+    at = torch.arange(na).view(na, 1).repeat(1, nt)  # anchor tensor, same as .repeat_interleave(nt)
+    angle_list = []
+    style = 'rect4'
     for i in range(det.nl):
         anchors = det.anchors[i]
         gain[2:6] = torch.tensor(p[i].shape)[[3, 2, 3, 2]]  # xyxy gain
 
         # Match targets to anchors
-        t = targets * gain
+        a, t, offsets = [], targets * gain, 0
         if nt:
-            # Matches
-            r = t[:, :, 4:6] / anchors[:, None]  # wh ratio
+            r = t[None, :, 4:6] / anchors[:, None]  # wh ratio
             j = torch.max(r, 1. / r).max(2)[0] < model.hyp['anchor_t']  # compare
-            # j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n)=wh_iou(anchors(3,2), gwh(n,2))
-            t = t[j]  # filter
+            # j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n) = wh_iou(anchors(3,2), gwh(n,2))
+            a, t = at[j], t.repeat(na, 1, 1)[j]  # filter
 
-            # Offsets
+            # overlaps
             gxy = t[:, 2:4]  # grid xy
-            gxi = gain[[2, 3]] - gxy  # inverse
-            j, k = ((gxy % 1. < g) & (gxy > 1.)).T
-            l, m = ((gxi % 1. < g) & (gxi > 1.)).T
-            j = torch.stack((torch.ones_like(j), j, k, l, m))
-            t = t.repeat((5, 1, 1))[j]
-            offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j]
-        else:
-            t = targets[0]
-            offsets = 0
+            z = torch.zeros_like(gxy)
+            if style == 'rect2':
+                g = 0.2  # offset
+                j, k = ((gxy % 1. < g) & (gxy > 1.)).T
+                a, t = torch.cat((a, a[j], a[k]), 0), torch.cat((t, t[j], t[k]), 0)
+                offsets = torch.cat((z, z[j] + off[0], z[k] + off[1]), 0) * g
+
+            elif style == 'rect4':
+                g = 0.5  # offset
+                j, k = ((gxy % 1. < g) & (gxy > 1.)).T
+                l, m = ((gxy % 1. > (1 - g)) & (gxy < (gain[[2, 3]] - 1.))).T
+                a, t = torch.cat((a, a[j], a[k], a[l], a[m]), 0), torch.cat((t, t[j], t[k], t[l], t[m]), 0)
+                offsets = torch.cat((z, z[j] + off[0], z[k] + off[1], z[l] + off[2], z[m] + off[3]), 0) * g
 
         # Define
         b, c = t[:, :2].long().T  # image, class
+        angle = t[:, -1]
         gxy = t[:, 2:4]  # grid xy
         gwh = t[:, 4:6]  # grid wh
         gij = (gxy - offsets).long()
         gi, gj = gij.T  # grid xy indices
 
         # Append
-        a = t[:, 6].long()  # anchor indices
         indices.append((b, a, gj, gi))  # image, anchor, grid indices
         tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
         anch.append(anchors[a])  # anchors
         tcls.append(c)  # class
+        tangle.append(angle)
 
-    return tcls, tbox, indices, anch
+    return tcls, tbox, indices, anch, tangle
 
 
-def non_max_suppression(prediction, conf_thres=0.1, iou_thres=0.6, merge=False, classes=None, agnostic=False):
-    """Performs Non-Maximum Suppression (NMS) on inference results
 
-    Returns:
-         detections with shape: nx6 (x1, y1, x2, y2, conf, cls)
+# 计算旋转矩形iou
+def rotate_iou(box1, box2, GIoU=False):
     """
 
-    nc = prediction[0].shape[1] - 5  # number of classes
+    :param box1: GT
+    :param box2: anchor
+    :param GIoU:
+    :return: GT对应与anchor的iou
+    """
+    ft = torch.cuda.FloatTensor
+    if isinstance(box1, list):  box1 = ft(box1)
+    if isinstance(box2, list):  box2 = ft(box2)
+    # print(box1)
+    # print(box2)
+    if len(box1.shape) < len(box2.shape):  # 输入的单box维度不匹配时，unsqueeze一下
+        box1 = box1.unsqueeze(0)
+    if not box1.shape == box2.shape:
+        box1 = box1.repeat(len(box2), 1)
+    # print(box1)
+    box1 = box1[:, :5]
+    box2 = box2[:, :5]
+
+    if GIoU:
+        mode = 'giou'
+    else:
+        mode = 'iou'
+
+    ious = []
+    for i in range(len(box2)):
+        # print(i)
+        r_b1 = get_rotated_coors(box1[i])
+        r_b2 = get_rotated_coors(box2[i])
+
+        ious.append(skewiou(r_b1, r_b2, mode=mode))
+
+    # if GIoU:  # Generalized IoU https://arxiv.org/pdf/1902.09630.pdf
+    #     c_x1, c_x2 = torch.min(b1_x1, b2_x1), torch.max(b1_x2, b2_x2)
+    #     c_y1, c_y2 = torch.min(b1_y1, b2_y1), torch.max(b1_y2, b2_y2)
+    #     c_area = (c_x2 - c_x1) * (c_y2 - c_y1)  # convex area
+    #     return iou - (c_area - union_area) / c_area  # GIoU
+    # print(ious)
+    return ft(ious)
+
+def get_rotated_coors(box):
+    assert len(box) > 0 , 'Input valid box!'
+    cx = box[0]; cy = box[1]; w = box[2]; h = box[3]; a = box[4]
+    xmin = cx - w*0.5; xmax = cx + w*0.5; ymin = cy - h*0.5; ymax = cy + h*0.5
+    t_x0=xmin; t_y0=ymin; t_x1=xmin; t_y1=ymax; t_x2=xmax; t_y2=ymax; t_x3=xmax; t_y3=ymin
+    R = np.eye(3)
+    R[:2] = cv2.getRotationMatrix2D(angle=-a*180/math.pi, center=(cx,cy), scale=1)
+    x0 = t_x0*R[0,0] + t_y0*R[0,1] + R[0,2]
+    y0 = t_x0*R[1,0] + t_y0*R[1,1] + R[1,2]
+    x1 = t_x1*R[0,0] + t_y1*R[0,1] + R[0,2]
+    y1 = t_x1*R[1,0] + t_y1*R[1,1] + R[1,2]
+    x2 = t_x2*R[0,0] + t_y2*R[0,1] + R[0,2]
+    y2 = t_x2*R[1,0] + t_y2*R[1,1] + R[1,2]
+    x3 = t_x3*R[0,0] + t_y3*R[0,1] + R[0,2]
+    y3 = t_x3*R[1,0] + t_y3*R[1,1] + R[1,2]
+
+    if isinstance(x0,torch.Tensor):
+        r_box=torch.cat([x0.unsqueeze(0),y0.unsqueeze(0),
+                         x1.unsqueeze(0),y1.unsqueeze(0),
+                         x2.unsqueeze(0),y2.unsqueeze(0),
+                         x3.unsqueeze(0),y3.unsqueeze(0)], 0)
+    else:
+        r_box = np.array([x0,y0,x1,y1,x2,y2,x3,y3])
+    return r_box
+
+# anchor对齐阶段计算iou
+def skewiou(box1, box2,mode='iou',return_coor = False):
+    a=box1.reshape(4, 2)
+    b=box2.reshape(4, 2)
+    # 所有点的最小凸的表示形式，四边形对象，会自动计算四个点，最后顺序为：左上 左下  右下 右上 左上
+    poly1 = Polygon(a).convex_hull
+    poly2 = Polygon(b).convex_hull
+    if not poly1.is_valid or not poly2.is_valid:
+        print('formatting errors for boxes!!!! ')
+        return 0
+    if  poly1.area == 0 or  poly2.area  == 0 :
+        return 0
+
+    inter = Polygon(poly1).intersection(Polygon(poly2)).area
+    if   mode == 'iou':
+        union = poly1.area + poly2.area - inter
+    elif mode =='tiou':
+        union_poly = np.concatenate((a,b))   #合并两个box坐标，变为8*2
+        union = MultiPoint(union_poly).convex_hull.area
+        coors = MultiPoint(union_poly).convex_hull.wkt
+    elif mode == 'giou':
+        union_poly = np.concatenate((a,b))
+        union = MultiPoint(union_poly).envelope.area
+        coors = MultiPoint(union_poly).envelope.wkt
+    elif mode == 'r_giou':
+        union_poly = np.concatenate((a,b))
+        union = MultiPoint(union_poly).minimum_rotated_rectangle.area
+        coors = MultiPoint(union_poly).minimum_rotated_rectangle.wkt
+    else:
+        print('incorrect mode!')
+
+    if union == 0:
+        return 0
+    else:
+        if return_coor:
+            return inter/union,coors
+        else:
+            return inter/union
+
+
+def nms(boxes, scores, thres=0.2):
+    _, conf_sort_index = torch.sort(scores, descending=True)
+    sort_boxes = boxes[conf_sort_index]
+    max_iou_boxes = []
+    index = []
+    while sort_boxes.size(0):
+        max_iou_boxes.append(sort_boxes[0].unsqueeze(0))
+        if len(sort_boxes) == 1:
+            break
+        rotate_ious = rotate_iou(max_iou_boxes[-1], sort_boxes[1:])
+        sort_boxes = sort_boxes[1:][rotate_ious < thres]
+    max_iou_boxes = torch.cat(max_iou_boxes).data
+    for d in max_iou_boxes:
+        index.append((torch.sum((boxes==d),dim=1)==5).nonzero()[0].item())
+
+
+
+    # return torch.from_numpy(np.array((index)))
+    return np.array(index)
+
+
+def rotate_non_max_suppression(prediction, conf_thres=0.1, iou_thres=0.6, merge=False, classes=None, agnostic=True):
+    nc = prediction[0].shape[1] - 5 - 180  # number of classes
     xc = prediction[..., 4] > conf_thres  # candidates
 
     # Settings
@@ -623,17 +829,112 @@ def non_max_suppression(prediction, conf_thres=0.1, iou_thres=0.6, merge=False, 
             continue
 
         # Compute conf
-        x[:, 5:] *= x[:, 4:5]  # conf = obj_conf * cls_conf
+        x[:, 5:10] *= x[:, 4:5]  # conf = obj_conf * cls_conf
+
+        # Box (center x, center y, width, height) to (x1, y1, x2, y2)
+
+        angle = x[:, 10:190]
+        angle_value, angle_index = torch.max(angle, 1, keepdim=True)
+        box = torch.cat((x[:, :4], (angle_index - 90) * np.pi / 180), 1)
+        # Detections matrix nx6 (xyxy, conf, cls)
+        if multi_label:
+            i, j = (x[:, 5:10] > conf_thres).nonzero(as_tuple=False).T
+            x = torch.cat((box[i], x[i, j + 5, None], j[:, None].float()), 1)
+
+        else:  # best class only
+            conf, j = x[:, 5:10].max(1, keepdim=True)
+            x = torch.cat((box, conf, j.float()), 1)[conf.view(-1) > conf_thres]
+
+        # Filter by class
+        if classes:
+            x = x[(x[:, 5:6] == torch.tensor(classes, device=x.device)).any(1)]
+
+        # Apply finite constraint
+        # if not torch.isfinite(x).all():
+        #     x = x[torch.isfinite(x).all(1)]
+
+        # If none remain process next image
+        n = x.shape[0]  # number of boxes
+        if not n:
+            continue
+
+        # Sort by confidence
+        # x = x[x[:, 4].argsort(descending=True)]
+
+        # Batched NMS
+        c = x[:, 6:7] * (0 if agnostic else max_wh)  # classes
+        boxes, scores = x[:, :5] + c, x[:, 5]  # boxes (offset by class), scores
+        # 将 boxes加上角度，角度使用弧度制
+        i = nms(boxes, scores)
+        if i.shape[0] > max_det:  # limit detections
+            i = i[:max_det]
+        if merge and (1 < n < 3E3):  # Merge NMS (boxes merged using weighted mean)
+            try:  # update boxes as boxes(i,4) = weights(i,n) * boxes(n,4)
+                iou = box_iou(boxes[i], boxes) > iou_thres  # iou matrix
+                weights = iou * scores[None]  # box weights
+                x[i, :4] = torch.mm(weights, x[:, :4]).float() / weights.sum(1, keepdim=True)  # merged boxes
+                if redundant:
+                    i = i[iou.sum(1) > 1]  # require redundancy
+            except:  # possible CUDA error https://github.com/ultralytics/yolov3/issues/1139
+                print(x, i, x.shape, i.shape)
+                pass
+
+        output[xi] = x[i]
+        # angle_index = angle_index[i]
+
+        if (time.time() - t) > time_limit:
+            break  # time limit exceeded
+
+
+    return output
+
+
+
+def non_max_suppression(prediction, conf_thres=0.1, iou_thres=0.6, merge=False, classes=None, agnostic=False):
+    """Performs Non-Maximum Suppression (NMS) on inference results
+
+    注：yolov5 在模型的Head中已经将结果进行相应的sigmoid操作以及回归对应anchor操作
+
+    Returns:
+         detections with shape: nx6 (x1, y1, x2, y2, conf, cls)
+    """
+
+    nc = prediction[0].shape[1] - 5 - 180  # number of classes
+    xc = prediction[..., 4] > conf_thres  # candidates
+
+    # Settings
+    min_wh, max_wh = 2, 4096  # (pixels) minimum and maximum box width and height
+    max_det = 300  # maximum number of detections per image
+    time_limit = 10.0  # seconds to quit after
+    redundant = True  # require redundant detections
+    multi_label = nc > 1  # multiple labels per box (adds 0.5ms/img)
+
+    t = time.time()
+    output = [None] * prediction.shape[0]
+    for xi, x in enumerate(prediction):  # image index, image inference
+        # Apply constraints
+        # x[((x[..., 2:4] < min_wh) | (x[..., 2:4] > max_wh)).any(1), 4] = 0  # width-height
+        x = x[xc[xi]]  # confidence
+
+        # If none remain process next image
+        if not x.shape[0]:
+            continue
+
+        # Compute conf
+        x[:, 5:10] *= x[:, 4:5]  # conf = obj_conf * cls_conf
 
         # Box (center x, center y, width, height) to (x1, y1, x2, y2)
         box = xywh2xyxy(x[:, :4])
 
+        angle = x[:, 10:190]
+        angle_value, angle_index = torch.max(angle, 1, keepdim=True)
         # Detections matrix nx6 (xyxy, conf, cls)
         if multi_label:
-            i, j = (x[:, 5:] > conf_thres).nonzero(as_tuple=False).T
-            x = torch.cat((box[i], x[i, j + 5, None], j[:, None].float()), 1)
+            i, j = (x[:, 5:10] > conf_thres).nonzero(as_tuple=False).T
+            x = torch.cat((box[i], x[i, j + 5, None], j[:, None].float(), angle_index[i]), 1)
+
         else:  # best class only
-            conf, j = x[:, 5:].max(1, keepdim=True)
+            conf, j = x[:, 5:10].max(1, keepdim=True)
             x = torch.cat((box, conf, j.float()), 1)[conf.view(-1) > conf_thres]
 
         # Filter by class
@@ -655,6 +956,7 @@ def non_max_suppression(prediction, conf_thres=0.1, iou_thres=0.6, merge=False, 
         # Batched NMS
         c = x[:, 5:6] * (0 if agnostic else max_wh)  # classes
         boxes, scores = x[:, :4] + c, x[:, 4]  # boxes (offset by class), scores
+        # 将 boxes加上角度，角度使用弧度制
         i = torch.ops.torchvision.nms(boxes, scores, iou_thres)
         if i.shape[0] > max_det:  # limit detections
             i = i[:max_det]
@@ -670,6 +972,8 @@ def non_max_suppression(prediction, conf_thres=0.1, iou_thres=0.6, merge=False, 
                 pass
 
         output[xi] = x[i]
+        # angle_index = angle_index[i]
+
         if (time.time() - t) > time_limit:
             break  # time limit exceeded
 
@@ -979,20 +1283,72 @@ def butter_lowpass_filtfilt(data, cutoff=1500, fs=50000, order=5):
     b, a = butter_lowpass(cutoff, fs, order=order)
     return filtfilt(b, a, data)  # forward-backward filter
 
+def rectlong2opencv(boxes):
 
-def plot_one_box(x, img, color=None, label=None, line_thickness=None):
+    boxes_ = boxes.copy()
+    boxes_[boxes[..., 4] < 0, 2] = boxes[boxes[..., 4] < 0, 3]
+    boxes_[boxes[..., 4] < 0, 3] = boxes[boxes[..., 4] < 0, 2]
+    boxes_[boxes[..., 4] >= 0, 4] = boxes[boxes[..., 4] >= 0, 4] - 90
+    gt_box = boxes_.copy()
+    gt_box[..., 2] = boxes_[..., 3]
+    gt_box[..., 3] = boxes_[..., 2]
+    return gt_box
+
+
+def rectlong2opencv_cuda(boxes):
+    boxes_ = boxes.clone()
+    boxes_[boxes[..., 4] < 0, 2] = boxes[boxes[..., 4] < 0, 3]
+    boxes_[boxes[..., 4] < 0, 3] = boxes[boxes[..., 4] < 0, 2]
+    boxes_[boxes[..., 4] >= 0, 4] = boxes[boxes[..., 4] >= 0, 4] - 90
+    gt_box = boxes_.clone()
+    gt_box[..., 2] = boxes_[..., 3]
+    gt_box[..., 3] = boxes_[..., 2]
+    return gt_box
+
+
+
+
+def plot_one_box(x, img, color=None, label=None, line_thickness=None, path=None):
     # Plots one bounding box on image img
+    maxbox = Polygon([(0, 0), (img.shape[1], 0), (img.shape[1], img.shape[0]),(0, img.shape[0])])
+    x = np.array(x)
+    x[-1] *= 180 / np.pi
+    opencv_rect = rectlong2opencv(x)
     tl = line_thickness or round(0.002 * (img.shape[0] + img.shape[1]) / 2) + 1  # line/font thickness
     color = color or [random.randint(0, 255) for _ in range(3)]
-    c1, c2 = (int(x[0]), int(x[1])), (int(x[2]), int(x[3]))
-    cv2.rectangle(img, c1, c2, color, thickness=tl, lineType=cv2.LINE_AA)
-    if label:
-        tf = max(tl - 1, 1)  # font thickness
-        t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
-        c2 = c1[0] + t_size[0], c1[1] - t_size[1] - 3
-        cv2.rectangle(img, c1, c2, color, -1, cv2.LINE_AA)  # filled
-        cv2.putText(img, label, (c1[0], c1[1] - 2), 0, tl / 3, [225, 255, 255], thickness=tf, lineType=cv2.LINE_AA)
+    cx, cy, w, h, angle =opencv_rect
+    # cv2.rectangle(img, c1, c2, color, thickness=tl, lineType=cv2.LINE_AA)
+    rect = ((cx, cy), (w, h), angle)
+    box = cv2.boxPoints(rect).astype(int)
+    poly_box = Polygon([(box[0][0],box[0][1]), (box[1][0],box[1][1]), (box[2][0],box[2][1]),(box[3][0],box[3][1])])
+    _x, _y = poly_box.intersection(maxbox).exterior.coords.xy
 
+    if(len(_x) == 5):
+        for k, (i, j) in enumerate(zip(list(_x), list(_y))):
+
+            if k <= 3:
+                box[k] = [i,j]
+    else:
+        data = np.concatenate((np.array(_x[:-1]).reshape(len(_x)-1, -1),np.array(_y[:-1]).reshape(len(_x)-1, -1)), -1).astype(int)
+        rect = cv2.minAreaRect(data)
+        box = cv2.boxPoints(rect).astype(int)
+
+    cv2.line(img, tuple(box[0]), tuple(box[1]), color, tl)
+    cv2.line(img, tuple(box[1]), tuple(box[2]), color, tl)
+    cv2.line(img, tuple(box[2]), tuple(box[3]), color, tl)
+    cv2.line(img, tuple(box[3]), tuple(box[0]), color, tl)
+    # if label:
+    #
+    #     tf = max(tl - 1, 1)  # font thickness
+    #     t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
+    #     c2 = c1[0] + t_size[0], c1[1] - t_size[1] - 3
+    #     cv2.rectangle(img, c1, c2, color, -1, cv2.LINE_AA)  # filled
+    #     cv2.putText(img, label, (c1[0], c1[1] - 2), 0, tl / 3, [225, 255, 255], thickness=tf, lineType=cv2.LINE_AA)
+    with open(r'inference/results.txt',
+              'a') as f:
+
+        f.write(path.split('\\')[-1] + ' ' + label + ' ' + str(box[0][0]) + ' ' + str(box[0][1]) + ' ' + str(box[1][0]) + ' ' + str(box[1][1]) + ' ' + str(box[2][0]) + ' ' + str(box[2][1]) + ' ' + str(box[3][0]) + ' ' + str(box[3][1]) + '\n')
+    f.close()
 
 def plot_wh_methods():  # from utils.general import *; plot_wh_methods()
     # Compares the two methods for width-height anchor multiplication
@@ -1064,8 +1420,9 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max
             image_targets = targets[targets[:, 0] == i]
             boxes = xywh2xyxy(image_targets[:, 2:6]).T
             classes = image_targets[:, 1].astype('int')
-            gt = image_targets.shape[1] == 6  # ground truth if no conf column
-            conf = None if gt else image_targets[:, 6]  # check for confidence presence (gt vs pred)
+            # gt = image_targets.shape[1] == 6
+            gt = image_targets.shape[1] == 7  # ground truth if no conf column
+            conf = None if gt else image_targets[:, 7]  # check for confidence presence (gt vs pred)
 
             boxes[[0, 2]] *= w
             boxes[[0, 2]] += block_x

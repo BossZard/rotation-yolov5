@@ -829,20 +829,21 @@ def rotate_non_max_suppression(prediction, conf_thres=0.1, iou_thres=0.6, merge=
             continue
 
         # Compute conf
-        x[:, 5:10] *= x[:, 4:5]  # conf = obj_conf * cls_conf
+        x[:, 5:5 + nc] *= x[:, 4:5]  # conf = obj_conf * cls_conf
 
         # Box (center x, center y, width, height) to (x1, y1, x2, y2)
 
-        angle = x[:, 10:190]
+        angle = x[:, 5 + nc:-1]
         angle_value, angle_index = torch.max(angle, 1, keepdim=True)
         box = torch.cat((x[:, :4], (angle_index - 90) * np.pi / 180), 1)
         # Detections matrix nx6 (xyxy, conf, cls)
         if multi_label:
-            i, j = (x[:, 5:10] > conf_thres).nonzero(as_tuple=False).T
+            i, j = (x[:, 5:5 + nc] > conf_thres).nonzero(as_tuple=False).T
             x = torch.cat((box[i], x[i, j + 5, None], j[:, None].float()), 1)
 
         else:  # best class only
-            conf, j = x[:, 5:10].max(1, keepdim=True)
+            conf, j = x[:, 5:5 + nc].max(1, keepdim=True)
+            conf, j = x[:, 5:5 + nc].max(1, keepdim=True)
             x = torch.cat((box, conf, j.float()), 1)[conf.view(-1) > conf_thres]
 
         # Filter by class

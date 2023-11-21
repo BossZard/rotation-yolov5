@@ -6,7 +6,7 @@ shapely==1.7.1
 opencv==4.2.0.34
 ```
 # inference
-you can download the [weights](https://pan.baidu.com/s/1l7AwoT78tQEQ-K_vOJobQQ)(password is 4ud5) for ship detection by my dataset(not DOTA) to test the demo.
+you can download the weights [BaiduYun](https://pan.baidu.com/s/1l7AwoT78tQEQ-K_vOJobQQ)(password is 4ud5) or [GoogleDrive](https://drive.google.com/drive/folders/1McWvzy_UAUCOBFmzjzawVqC0KroSLmEy?usp=sharing) for ship detection by my dataset(not DOTA) to test the demo.
 ```bash
 $ python detect.py
 ```
